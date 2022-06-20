@@ -1,320 +1,499 @@
 import io
-import os.path
-import string
-import sys
+import os
 import pickle
+import sys
 import zipfile
+from argparse import ArgumentParser
 
-import keras.losses
-import pandas as pd
+import keras_nlp
 import unidecode
-from keras import Sequential
-from keras.callbacks import ModelCheckpoint
-from keras.layers import Embedding, LSTM, RepeatVector, Dense
-from keras.models import load_model
-from keras.optimizer_v2.rmsprop import RMSprop
-from keras_preprocessing.sequence import pad_sequences
-from keras_preprocessing.text import Tokenizer
-from numpy import array
-from sklearn.model_selection import train_test_split
+from keras.api.keras import layers
+from keras.layers import TextVectorization
+
+import random
+import string
+import numpy as np
+import tensorflow as tf
+from tensorflow import keras
+from keras.utils.vis_utils import plot_model
 
 
-OUTPUT_DIM = 1024
-
-
-def prepare_text_zip(input_archive:str, input_file:str, output_dir:str):
+def prepare_text_zip(input_archive: str,
+                     input_file: str,
+                     output_dir: str,
+                     flip_translation=False,
+                     limit_lines=50000,
+                     vocab_size=50000,
+                     sequence_length=16):
     """
-
     :param input_archive: path to zip file containing the input_file
     :param input_file: name of file inside input_archive containing raw training data
-    :param output_file: path for saving pickle list containing processed training data
+    :param output_dir: path for saving pickle list containing processed training data
+    :param flip_translation: select text data for eng->target or target->eng translation
+    :param limit_lines: max number of lines to train
+    :param vocab_size: vectorizer size
+    :param sequence_length: max sequence length in tokens/words
     """
+    # generate a random seed for working with this dataset
+    random.seed(random.choice([0xDEADBEEF, 0xBADF00D, 0xDECAFBAD, 0x1BADB002]))
+    pickled_seed = int(random.random()*1_000_000)
 
-    data = []
+    text_pairs = []
     trans_punctuation = str.maketrans('', '', string.punctuation)
 
     with zipfile.ZipFile(input_archive) as zfile:
         with zfile.open(input_file) as readfile:
             for line in io.TextIOWrapper(readfile, 'utf-8'):
                 line_str = str(line)
-                clean_str = unidecode.unidecode(line_str)\
-                    .strip()\
-                    .lower()\
+                clean_str = unidecode.unidecode(line_str) \
+                    .strip() \
+                    .lower() \
                     .translate(trans_punctuation)
 
-                data += [clean_str.split("\t")]
+                eng, target, _ = clean_str.split("\t")
 
-    lines_array = array(data)
+                # 1. handle bi-directional translation
+                # 2. wrap target sentence in [start]/[stop] tags
+                if flip_translation:
+                    text_pairs.append((target, "[start] " + eng + " [end]"))
+                else:
+                    text_pairs.append((eng, "[start] " + target + " [end]"))
 
-    # Limit lines to fit in GPU memory
-    lines_array = lines_array[:2500, :]
-
-    # Remove attribution field
-    lines_array = lines_array[:, :2]
-
-    print(lines_array)
-
-    save_input_data(lines_array, output_dir)
-
-
-def prepare_text(input_file:str, output_dir:str):
-    """
-    :param input_file: path to text file containing raw training data
-    :param output_file: path for saving pickle list containing processed training data
-    """
-
-    with open(input_file, mode='rt', encoding='utf-8') as file_in:
-        data = file_in.read()
-
-    # TODO:
-    # lang = lang_file[:3] ???
-
-    # Remove accents
-    data = unidecode.unidecode(data)
-
-    # Remove extra whitespace
-    data = data.strip()
-
-    # Make lowercase
-    data = data.lower()
-
-    # Remove punctuation
-    trans_punctuation = str.maketrans('', '', string.punctuation)
-    data = data.translate(trans_punctuation)
-
-    # split into lines
-    lines = data.split('\n')
-
-    # split into sentences in,out
-    lines = [i.split('\t') for i in lines]
-
-    lines_array = array(lines)
+    random.shuffle(text_pairs)
 
     # Limit lines to fit in GPU memory
-    lines_array = lines_array[:2500, :]
+    if len(text_pairs) > limit_lines:
+        text_pairs = text_pairs[:limit_lines]
 
-    # Remove attribution field
-    lines_array = lines_array[:, :2]
+    # Print a few pairs
+    for _ in range(5):
+        print(random.choice(text_pairs))
 
-    print(lines_array)
+    # split the sentence pairs into a training set, a validation set, and a test set.
+    num_val_samples = int(0.15 * len(text_pairs))
+    num_train_samples = len(text_pairs) - 2 * num_val_samples
+    train_pairs = text_pairs[:num_train_samples]
+    val_pairs = text_pairs[num_train_samples: num_train_samples + num_val_samples]
+    test_pairs = text_pairs[num_train_samples + num_val_samples:]
+    test_texts = [pair[0] for pair in test_pairs]
 
-    save_input_data(lines_array, output_dir)
+    print(f"{len(text_pairs)} total pairs")
+    print(f"{len(train_pairs)} training pairs")
+    print(f"{len(val_pairs)} validation pairs")
+    print(f"{len(test_pairs)} test pairs")
 
+    source_vectorization = TextVectorization(
+        max_tokens=vocab_size,
+        output_mode="int",
+        output_sequence_length=sequence_length,
+        standardize=None
+    )
 
-def save_input_data(lines_array, output_dir):
+    target_vectorization = TextVectorization(
+        max_tokens=vocab_size,
+        output_mode="int",
+        output_sequence_length=sequence_length + 1,
+        standardize=None
+    )
+
+    train_source_texts = [pair[0] for pair in train_pairs]
+    train_target_texts = [pair[1] for pair in train_pairs]
+
+    # adapt vectorization
+    source_vectorization.adapt(train_source_texts)
+    target_vectorization.adapt(train_target_texts)
+
     os.makedirs(output_dir, exist_ok=True)
+
     # save pickle (used for creating translator)
-    output_file = os.path.join(output_dir, "phrases.pic")
-    with open(output_file, "wb") as file_out:  # Pickling
-        pickle.dump(lines_array, file_out)
-    # save plain text (for debug)
-    output_file = os.path.join(output_dir, "phrases.txt")
+    pickled_data = {
+        "source_vectorization": {
+            'config': source_vectorization.get_config(),
+            'weights': source_vectorization.get_weights()
+        },
+        "target_vectorization": {
+            'config': target_vectorization.get_config(),
+            'weights': target_vectorization.get_weights()
+        },
+        "train_pairs": train_pairs,
+        "val_pairs": val_pairs,
+        "test_pairs": test_pairs,
+
+        "vocab_size": vocab_size,
+        "sequence_length": sequence_length,
+
+        "seed": pickled_seed
+    }
+
+    output_file = os.path.join(output_dir, "text_data.pic")
+    with open(output_file, "wb") as file_out:
+        pickle.dump(pickled_data, file_out)
+
+    # save plain texts (for debug)
+    for text_file, textSource in [("train_pairs.txt", train_pairs), ("val_pairs.txt", val_pairs),
+                                  ("test_pairs.txt", test_pairs)]:
+        output_file = os.path.join(output_dir, text_file)
+        with open(output_file, "wt") as text_out:
+            for line in textSource:
+                text_out.write("%s\t%s\n" % (line[0], line[1]))
+
+    # save test texts for easy testing
+    output_file = os.path.join(output_dir, "test_texts.txt")
     with open(output_file, "wt") as text_out:
-        for line in lines_array:
-            text_out.write("%s\t%s\n" % (line[0], line[1]))
+        for line in test_texts:
+            text_out.write(line + "\n")
 
 
-# def init_cuda():
-#     from tensorflow.compat.v1.keras.backend import set_session
-#     import tensorflow as tf
-#     config = tf.compat.v1.ConfigProto()
-#     config.gpu_options.allow_growth = True  # dynamically grow the memory used on the GPU
-#     config.gpu_options.experimental.use_cuda_malloc_async = True #This leverages the new async allocation APIs.
-#     config.log_device_placement = True  # to log device placement (on which device the operation ran)
-#     sess = tf.compat.v1.Session(config=config)
-#     set_session(sess)
+def load_text_data(data_dir):
+    """
+    Loads pickled text data and reinits TextVectorization
+    :param data_dir:
+    :return:
+    """
+    input_file = os.path.join(data_dir, "text_data.pic")
+    with open(input_file, "rb") as file_in:
+        pickled_data = pickle.load(file_in)
+
+    source_vectorization = TextVectorization.from_config(pickled_data['source_vectorization']['config'])
+    target_vectorization = TextVectorization.from_config(pickled_data['target_vectorization']['config'])
+
+    # You have to call `adapt` with some dummy data (BUG in Keras)
+    source_vectorization.adapt(tf.data.Dataset.from_tensor_slices(["xyz"]))
+    source_vectorization.set_weights(pickled_data['source_vectorization']['weights'])
+
+    target_vectorization.adapt(tf.data.Dataset.from_tensor_slices(["xyz"]))
+    target_vectorization.set_weights(pickled_data['target_vectorization']['weights'])
+
+    return pickled_data, source_vectorization, target_vectorization
 
 
-def create_translator(input_dir: str, translator_dir: str):
-    # init_cuda()
+def create_datasets(pickled_data, source_vectorization, target_vectorization, batch_size):
+    """
+    Helper for creating training datasets
+    based on https://keras.io/examples/nlp/neural_machine_translation_with_transformer/
+    :param pickled_data:
+    :param source_vectorization:
+    :param target_vectorization:
+    :param batch_size:
+    :return:
+    """
+    def format_dataset(source, target):
+        source = source_vectorization(source)
+        target = target_vectorization(target)
+        return (
+            {
+                "encoder_inputs": source,
+                "decoder_inputs": target[:, :-1],
+            },
+            target[:, 1:],
+        )
 
-    input_file = os.path.join(input_dir, "phrases.pic")
-    with open(input_file, "rb") as file_in:  # Unpickling
-        sentences = pickle.load(file_in)
-        print(sentences)
+    def make_dataset(pairs):
+        source_texts, target_texts = zip(*pairs)
+        source_texts = list(source_texts)
+        target_texts = list(target_texts)
+        dataset = tf.data.Dataset.from_tensor_slices((source_texts, target_texts))
+        dataset = dataset.batch(batch_size)
+        dataset = dataset.map(format_dataset)
+        return dataset.shuffle(2048, seed=pickled_data["seed"]).prefetch(16).cache()
 
-    # function to build a tokenizer
-    def tokenization(lines):
-        tokenizer = Tokenizer()
-        tokenizer.fit_on_texts(lines)
-        return tokenizer
+    train_ds = make_dataset(pickled_data["train_pairs"])
+    val_ds = make_dataset(pickled_data["val_pairs"])
 
-    # prepare data inputs
-    tokenizer_in = tokenization(sentences[:, 0])
-    tokenizer_in_length = len(tokenizer_in.word_index) + 1
+    return train_ds, val_ds
 
-    tokenizer_out = tokenization(sentences[:, 1])
-    tokenizer_out_length = len(tokenizer_out.word_index) + 1
+
+class TransformerDecoder(layers.Layer):
+    """
+    TransformerDecoder implementation
+    keras_nlp.layers.TransformerEncoder performed significantly worse
+    Based on https://keras.io/examples/nlp/neural_machine_translation_with_transformer/
+    """
+    def __init__(self, embed_dim, latent_dim, num_heads, **kwargs):
+        super(TransformerDecoder, self).__init__(**kwargs)
+        self.embed_dim = embed_dim
+        self.latent_dim = latent_dim
+        self.num_heads = num_heads
+        self.attention_1 = layers.MultiHeadAttention(
+            num_heads=num_heads, key_dim=embed_dim
+        )
+        self.attention_2 = layers.MultiHeadAttention(
+            num_heads=num_heads, key_dim=embed_dim
+        )
+        self.dense_proj = keras.Sequential(
+            [
+                layers.Dense(latent_dim, activation="relu"),
+                layers.Dense(embed_dim),
+            ]
+        )
+        self.layernorm_1 = layers.LayerNormalization()
+        self.layernorm_2 = layers.LayerNormalization()
+        self.layernorm_3 = layers.LayerNormalization()
+        self.supports_masking = True
+        self.padding_mask = None
+
+    def call(self, inputs, encoder_outputs, mask=None):
+        causal_mask = self.get_causal_attention_mask(inputs)
+        if mask is not None:
+            self.padding_mask = tf.cast(mask[:, tf.newaxis, :], dtype="int32")
+            self.padding_mask = tf.minimum(self.padding_mask, causal_mask)
+
+        attention_output_1 = self.attention_1(
+            query=inputs, value=inputs, key=inputs, attention_mask=causal_mask
+        )
+        out_1 = self.layernorm_1(inputs + attention_output_1)
+
+        attention_output_2 = self.attention_2(
+            query=out_1,
+            value=encoder_outputs,
+            key=encoder_outputs,
+            attention_mask=self.padding_mask,
+        )
+        out_2 = self.layernorm_2(out_1 + attention_output_2)
+
+        proj_output = self.dense_proj(out_2)
+        return self.layernorm_3(out_2 + proj_output)
+
+    def get_causal_attention_mask(self, inputs):
+        input_shape = tf.shape(inputs)
+        batch_size, sequence_length = input_shape[0], input_shape[1]
+        i = tf.range(sequence_length)[:, tf.newaxis]
+        j = tf.range(sequence_length)
+        mask = tf.cast(i >= j, dtype="int32")
+        mask = tf.reshape(mask, (1, input_shape[1], input_shape[1]))
+        mult = tf.concat(
+            [tf.expand_dims(batch_size, -1), tf.constant([1, 1], dtype=tf.int32)],
+            axis=0,
+        )
+        return tf.tile(mask, mult)
+
+    def get_config(self):
+        config = super(TransformerDecoder, self).get_config()
+        config.update({"embed_dim": self.embed_dim})
+        config.update({"latent_dim": self.latent_dim})
+        config.update({"num_heads": self.num_heads})
+        return config
+
+    # There's actually no need to define `from_config` here, since returning
+    # `cls(**config)` is the default behavior.
+    @classmethod
+    def from_config(cls, config):
+        # self.embed_dim = config["embed_dim"]
+        # self.latent_dim = config["latent_dim"]
+        # self.num_heads = config["num_heads"]
+        return cls(**config)
+
+
+def create_translator(input_dir: str, translator_dir: str, batch_size=256, embed_dim=256, latent_dim=1024, num_heads=6,
+                      dropout=0.0125, epochs=4):
+    """
+    Builds a end-to-end translation model
+
+    :param input_dir:
+    :param translator_dir:
+    :param batch_size:
+    :param embed_dim:
+    :param latent_dim:
+    :param num_heads:
+    :param dropout:
+    :param epochs:
+    """
+    pickled_data, source_vectorization, target_vectorization = load_text_data(input_dir)
+    train_ds, val_ds = create_datasets(pickled_data, source_vectorization, target_vectorization, batch_size)
+
+    for inputs, targets in train_ds.take(1):
+        print(f'inputs["encoder_inputs"].shape: {inputs["encoder_inputs"].shape}')
+        print(f'inputs["decoder_inputs"].shape: {inputs["decoder_inputs"].shape}')
+        print(f"targets.shape: {targets.shape}")
+
+    # assemble the end-to-end model.
+
+    encoder_inputs = keras.Input(shape=(None,), dtype="int64", name="encoder_inputs")
+
+    x = keras_nlp.layers.TokenAndPositionEmbedding(
+        vocabulary_size=pickled_data["vocab_size"],
+        sequence_length=pickled_data["sequence_length"],
+        embedding_dim=embed_dim
+    )(encoder_inputs)
+
+    encoder_transformer = keras_nlp.layers.TransformerEncoder(intermediate_dim=latent_dim,
+                                                              num_heads=num_heads,
+                                                              name="TransformerEncoder",
+                                                              dropout=dropout)
+    encoder_outputs = encoder_transformer(x)
+
+    encoder = keras.Model(encoder_inputs, encoder_outputs)
+
+    decoder_inputs = keras.Input(shape=(None,), dtype="int64", name="decoder_inputs")
+    encoded_seq_inputs = keras.Input(shape=(None, embed_dim), name="decoder_state_inputs")
+
+    decoder_embedding_layer = keras_nlp.layers.TokenAndPositionEmbedding(pickled_data["sequence_length"],
+                                                                         pickled_data["vocab_size"],
+                                                                         embed_dim,
+                                                                         )
+    x = decoder_embedding_layer(decoder_inputs)
+
+    # using custom class
+    x = TransformerDecoder(embed_dim, latent_dim, num_heads)(x, encoded_seq_inputs)
+
+    x = layers.Dropout(dropout)(x)
+
+    decoder_outputs = layers.Dense(pickled_data["vocab_size"], activation="softmax")(x)
+    decoder = keras.Model([decoder_inputs, encoded_seq_inputs], decoder_outputs)
+
+    decoder_outputs = decoder([decoder_inputs, encoder_outputs])
+    transformer = keras.Model(
+        [encoder_inputs, decoder_inputs], decoder_outputs, name="transformer"
+    )
+
+    transformer.summary()
+    transformer.compile(
+        "rmsprop", loss="sparse_categorical_crossentropy", metrics=["accuracy"]
+    )
 
     os.makedirs(translator_dir, exist_ok=True)
+    plot_model(transformer, show_shapes=True, to_file=os.path.join(translator_dir, "transformer.png"))
 
-    translator_file = os.path.join(translator_dir, "translator.h5")
-    checkpoint = ModelCheckpoint(translator_file, monitor='val_loss', verbose=1, save_best_only=True, mode='min')
+    # must train at least one epoch before saving
+    transformer.fit(train_ds, epochs=epochs, validation_data=val_ds)
 
-    print('Input Vocabulary Size: %d' % tokenizer_in_length)
-    print('Output Vocabulary Size: %d' % tokenizer_out_length)
-
-    # encode and pad sequences
-    def encode_sequences(tokenizer, length, lines):
-        # integer encode sequences
-        seq = tokenizer.texts_to_sequences(lines)
-        # pad sequences with 0 values
-        seq = pad_sequences(seq, maxlen=length, padding='post')
-        return seq
-
-    # split data into train and test set
-    train, test = train_test_split(sentences, test_size=0.2, random_state=12)
-
-    # prepare training data
-    trainX = encode_sequences(tokenizer_out, tokenizer_out_length, train[:, 1])
-    trainY = encode_sequences(tokenizer_in, tokenizer_in_length, train[:, 0])
-
-    # prepare and save validation data
-    testX = encode_sequences(tokenizer_out, tokenizer_out_length, test[:, 1])
-    testY = encode_sequences(tokenizer_in, tokenizer_in_length, test[:, 0])
-
-    pickle.dump(test, open(os.path.join(translator_dir, "test.pkl"), 'wb'))
-    pickle.dump(testX, open(os.path.join(translator_dir, "testX.pkl"), 'wb'))
-
-    # build NMT model
-    def define_model(in_vocab, out_vocab, in_timesteps, out_timesteps, units):
-        new_model = Sequential()
-        new_model.add(Embedding(input_dim=in_vocab, output_dim=units, input_length=in_timesteps, mask_zero=True))
-        new_model.add(LSTM(units=units))
-        new_model.add(RepeatVector(out_timesteps))
-        new_model.add(LSTM(units=units, return_sequences=True))
-        new_model.add(Dense(units=out_vocab, activation='softmax'))
-        return new_model
-
-    in_length = 8 # tokenizer_out_length
-    out_length = 8 # tokenizer_in_length
-    model = define_model(tokenizer_in_length, tokenizer_out_length, in_length, out_length, OUTPUT_DIM)
-
-    rms = RMSprop(learning_rate=0.001)
-    model.compile(optimizer=rms, loss=keras.losses.sparse_categorical_crossentropy) # loss='sparse_categorical_crossentropy')
-
-    model.summary()
-
-    def plot(model):
-        from keras.utils.vis_utils import plot_model
-        plot_model(model, show_shapes=True, to_file=os.path.join(translator_dir, "translator.png"))
-
-    plot(model)
-
-    # train model
-    history = model.fit(trainX, trainY.reshape(trainY.shape[0], trainY.shape[1], 1),
-                        epochs=30, batch_size=512, validation_split = 0.2, callbacks=[checkpoint],
-                        verbose=1)
-
-    pickle.dump(history, open(os.path.join(translator_dir, "history.pkl"), 'wb'))
+    transformer.save(os.path.join(translator_dir, "transformer.ts"))
 
 
-
-def run_translator(translator_dir: str, input_dir: str):
+def train_model(input_dir: str, translator_dir: str, epochs=16):
     """
-
-    :param translator_file: trained NN to load into translator
-    :param input_file: path to text file containing lines of text to be translated
-    :param output_file: path to where translated lines will be written
+    Allows training loaded models. Will overwrite the previous model.
+    :param input_dir:
+    :param translator_dir:
+    :param epochs:
     """
-
-    translator_file = os.path.join(translator_dir, "translator.h5")
-    model = load_model(translator_file)
-
-    test = pickle.load(open(os.path.join(translator_dir, "test.pkl"), 'rb'))
-    testX = pickle.load(open(os.path.join(translator_dir, "testX.pkl"), 'rb'))
-
-    testX.reshape((testX.shape[0], testX.shape[1]))
-    preds = model.predict(testX)
+    pickled_data, source_vectorization, target_vectorization = load_text_data(input_dir)
+    train_ds, val_ds = create_datasets(pickled_data, source_vectorization, target_vectorization, 256)
+    model = keras.models.load_model(os.path.join(translator_dir, "transformer.ts"))
+    model.fit(train_ds, epochs=epochs, validation_data=val_ds)
+    model.save(os.path.join(translator_dir, "transformer.ts"))
 
 
-    y_pred = preds[5]
-    preds_nn = []
+def translate_sequences(input_dir: str, translator_dir: str, sequences:[str]):
+    """
+    Uses a trained model to translate string sequence list passed via @sequences param
+    :param input_dir:
+    :param translator_dir:
+    :param sequences:
+    """
+    pickled_data, source_vectorization, target_vectorization = load_text_data(input_dir)
 
-    for k in range(8):
-        words_idx = [i for i, prob in enumerate(y_pred[k]) if prob > 0.5]
-        preds_nn = preds_nn + words_idx
+    target_vocab = target_vectorization.get_vocabulary()
+    target_index_lookup = dict(zip(range(len(target_vocab)), target_vocab))
 
+    model = keras.models.load_model(os.path.join(translator_dir, "transformer.ts"))
 
-    all_preds_nn = []
-    it = 0
-    for y_pred in preds[range(1000)]:
-        preds_nn = []
-        for k in range(8):
-            words_idx = [i for i, prob in enumerate(y_pred[k]) if prob > 0.5]
-            preds_nn = preds_nn + words_idx
+    for input_sentence in sequences:
+        input_sentence_clean = input_sentence.strip().replace("\n", "")
+        tokenized_input_sentence = source_vectorization([input_sentence_clean])
+        decoded_sentence = "[start]"
+        for i in range(pickled_data["sequence_length"]):
+            tokenized_target_sentence = target_vectorization([decoded_sentence])[:, :-1]
+            predictions = model([tokenized_input_sentence, tokenized_target_sentence])
 
-        if it % 100 == 0:
-            print(it)
+            sampled_token_index = np.argmax(predictions[0, i, :])
+            sampled_token = target_index_lookup[sampled_token_index]
+            decoded_sentence += " " + sampled_token
 
-        all_preds_nn.append(preds_nn)
-        it = it + 1
+            if sampled_token == "[end]":
+                break
 
-    def get_word(n, tokenizer):
-        for word, index in tokenizer.word_index.items():
-            if index == n:
-                return word
-        return None
-
-    def tokenization(lines):
-        tokenizer = Tokenizer()
-        tokenizer.fit_on_texts(lines)
-        return tokenizer
-
-    input_file = os.path.join(input_dir, "phrases.pic")
-    with open(input_file, "rb") as file_in:  # Unpickling
-        sentences = pickle.load(file_in)
-
-    eng_tokenizer = tokenization(sentences[:, 0])
+        print("in:[%s] -> out:[%s]" % (input_sentence_clean, decoded_sentence.replace("[start]","").replace("[end]","")))
 
 
-    preds_text = []
-    for i in all_preds_nn:
-        temp = []
-        for j in range(len(i)):
-            t = get_word(i[j], eng_tokenizer)
-            if j > 0:
-                if (t == get_word(i[j - 1], eng_tokenizer)) or (t == None):
-                    temp.append('')
-                else:
-                    temp.append(t)
-            else:
-                if (t == None):
-                    temp.append('')
-                else:
-                    temp.append(t)
+"""
+Command line handlers
+"""
 
-        preds_text.append(' '.join(temp))
+def handle_prep(args):
+    prepare_text_zip(args.archive,
+                     args.file,
+                     args.dir,
+                     args.flip,
+                     args.limit_lines,
+                     args.vocab_size,
+                     args.sequence_length)
 
-    pred_df = pd.DataFrame({'actual' : test[range(1000),0], 'predicted' : preds_text})
 
-    pred_df.sample(250)
+def handle_create(args):
+    create_translator(args.lang, args.model,
+                      args.batch_size,
+                      args.embed_dim,
+                      args.latent_dim,
+                      args.num_heads,
+                      args.dropout,
+                      args.epochs)
 
+def handle_train(args):
+    train_model(args.lang,
+                args.model,
+                args.epochs)
+
+
+def handle_translate(args):
+    if args.phrase:
+        translate_sequences(args.lang, args.model, [args.phrase])
+    elif args.file:
+        with open(args.file, "rt") as file_in:
+            translate_sequences(args.lang, args.model, file_in.readlines())
+
+"""
+Command line parser
+"""
 
 if __name__ == '__main__':
-    if len(sys.argv) > 2:
-        command = sys.argv[1]
-        if command == "prepare":
-            if len(sys.argv) == 5:
-                input_archive = sys.argv[2]
-                input_file = sys.argv[3]
-                output_dir = sys.argv[4]
-                print("Prepare data: %s::%s -> %s" % (input_archive, input_file, output_dir))
-                prepare_text_zip(input_archive, input_file, output_dir)
-            else:
-                input_file = sys.argv[2]
-                output_dir = sys.argv[3]
-                print("Prepare data: %s -> %s" % (input_file, output_dir))
-                prepare_text(input_file, output_dir)
+    parser = ArgumentParser(prog="translator.py", )
 
-        if command == "create":
-            input_dir = sys.argv[2]
-            translator_dir = sys.argv[3]
-            print("Create translator : %s -> %s" % (input_dir, translator_dir))
-            create_translator(input_dir, translator_dir)
+    subparsers = parser.add_subparsers(  # title='subcommands',
+                                         # description='valid subcommands',
+                                         # help='translator usage modes'
+    )
 
-        if command == "run":
-            input_dir = sys.argv[2]
-            translator_dir = sys.argv[3]
-            print("Run translator : %s, %s" % (input_dir, translator_dir))
-            run_translator(input_dir, translator_dir)
+    parser_prep = subparsers.add_parser('prepare', help='prepare translation data')
+    parser_prep.add_argument('archive', type=str, help='ankiweb archive path')
+    parser_prep.add_argument('file', type=str, help='path to file inside of archive')
+    parser_prep.add_argument('dir', type=str, help='path to save preprocessed data')
+    parser_prep.add_argument('-f', '--flip-translation-order', dest='flip', action='store_const', const=True, default=False, help='Flip translation order')
+    parser_prep.add_argument('-l', '--limit-lines', type=int, help='Limit number of text lines to train on', default=50_000, required=False)
+    parser_prep.add_argument('-s', '--vocab-size', type=int, help='Vectorization vocabulary size', default=50_000, required=False)
+    parser_prep.add_argument('-q', '--sequence-length', type=int, help='Vectorization max sequence size', default=20, required=False)
+    parser_prep.set_defaults(func=handle_prep)
+
+    parser_create = subparsers.add_parser('create', help='create translation model')
+    parser_create.add_argument('lang', type=str, help='path to language data')
+    parser_create.add_argument('model', type=str, help='path to translation model')
+    parser_create.add_argument('-b', '--batch-size', type=int, help='Training batch size', default=256, required=False)
+    parser_create.add_argument('-e', '--embed-dim', type=int, help='embedding dim', default=256, required=False)
+    parser_create.add_argument('-l', '--latent-dim', type=int, help='LSTM networks latent dim', default=1024, required=False)
+    parser_create.add_argument('-n', '--num-heads', type=int, help='number of tracked heads for causal attention tracking', default=6, required=False)
+    parser_create.add_argument('-d', '--dropout', type=float, help='dropout rate', default=0.125, required=False)
+    parser_create.add_argument('-t', '--epochs', type=int, help='epochs to pre-train', default=4, required=False)
+    parser_create.set_defaults(func=handle_create)
+
+    parser_train = subparsers.add_parser('train', help='train model')
+    parser_train.add_argument('lang', type=str, help='path to language data')
+    parser_train.add_argument('model', type=str, help='path to translation model')
+    parser_train.add_argument('epochs', type=int, help='epochs to train')
+    parser_train.set_defaults(func=handle_train)
+
+    parser_trans = subparsers.add_parser('translate', help='register user')
+    parser_trans.add_argument('lang', type=str, help='path to language data')
+    parser_trans.add_argument('model', type=str, help='path to translation model')
+    parser_trans.add_argument('-p', '--phrase', type=str, help='phrase to translate', required=False)
+    parser_trans.add_argument('-f', '--file', type=str, help='file to read phrases from', required=False)
+    parser_trans.set_defaults(func=handle_translate)
+
+    if len(sys.argv) < 2:
+        parser.print_help()
+        parser_prep.print_usage()
+        parser_create.print_usage()
+        parser_train.print_usage()
+        parser_trans.print_usage()
+    else:
+        args = parser.parse_args()
+        args.func(args)
