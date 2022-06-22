@@ -1,9 +1,15 @@
 import io
+import logging
 import os
 import pickle
 import sys
 import zipfile
+from datetime import datetime
 from argparse import ArgumentParser
+
+##############################
+# set TF logging level BEFORE importing TF dependency
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 
 import keras_nlp
 import unidecode
@@ -135,7 +141,7 @@ def prepare_text_zip(input_archive: str,
         output_file = os.path.join(output_dir, text_file)
         with open(output_file, "wt") as text_out:
             for line in textSource:
-                text_out.write("%s\t%s\n" % (line[0], line[1]))
+                text_out.write("%s\t%s\n" % (line[0], line[1].replace("[start]", "").replace("[end]", "")))
 
     # save test texts for easy testing
     output_file = os.path.join(output_dir, "test_texts.txt")
@@ -447,6 +453,19 @@ Command line parser
 """
 
 if __name__ == '__main__':
+    logFile = 'translator-%s.log' % datetime.now().strftime("%Y-%m-%d_%H_%M")
+    logLevel = logging.ERROR
+
+    # set up logging to file
+    logging.basicConfig(level=logging.DEBUG,
+                        format='%(asctime)s %(name)-12s %(levelname)-8s %(message)s',
+                        datefmt='%m-%d %H:%M',
+                        filename=logFile,
+                        filemode='w')
+
+    logger = logging.getLogger("MAIN")
+    logger.setLevel(logLevel)
+
     parser = ArgumentParser(prog="translator.py", )
 
     subparsers = parser.add_subparsers(  # title='subcommands',
