@@ -327,9 +327,9 @@ def create_translator(input_dir: str, translator_dir: str, batch_size=256, embed
     decoder_inputs = keras.Input(shape=(None,), dtype="int64", name="decoder_inputs")
     encoded_seq_inputs = keras.Input(shape=(None, embed_dim), name="decoder_state_inputs")
 
-    decoder_embedding_layer = keras_nlp.layers.TokenAndPositionEmbedding(pickled_data["sequence_length"],
-                                                                         pickled_data["vocab_size"],
-                                                                         embed_dim,
+    decoder_embedding_layer = keras_nlp.layers.TokenAndPositionEmbedding(pickled_data["vocab_size"],
+                                                                         pickled_data["sequence_length"],
+                                                                         embed_dim
                                                                          )
     x = decoder_embedding_layer(decoder_inputs)
 
