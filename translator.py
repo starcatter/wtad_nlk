@@ -397,6 +397,7 @@ def translate_sequences(input_dir: str, translator_dir: str, sequences:[str]):
 
     model = keras.models.load_model(os.path.join(translator_dir, "transformer.ts"))
 
+    results = []
     for input_sentence in sequences:
         input_sentence_clean = input_sentence.strip().replace("\n", "")
         tokenized_input_sentence = source_vectorization([input_sentence_clean])
@@ -412,7 +413,9 @@ def translate_sequences(input_dir: str, translator_dir: str, sequences:[str]):
             if sampled_token == "[end]":
                 break
 
-        print("in:[%s] -> out:[%s]" % (input_sentence_clean, decoded_sentence.replace("[start]","").replace("[end]","")))
+        results.append( (input_sentence_clean, decoded_sentence.replace("[start]", "").replace("[end]", "") ))
+
+    return results
 
 
 """
@@ -446,10 +449,17 @@ def handle_train(args):
 
 def handle_translate(args):
     if args.phrase:
-        translate_sequences(args.lang, args.model, [args.phrase])
+        for seq_in,seq_out in translate_sequences(args.lang, args.model, [args.phrase]):
+            print("in:[%s] -> out:[%s]" % (seq_in, seq_out))
     elif args.file:
         with open(args.file, "rt") as file_in:
-            translate_sequences(args.lang, args.model, file_in.readlines())
+            lines = file_in.readlines()
+
+        if args.sample:
+            lines = random.sample(lines, args.sample )
+
+        for seq_in,seq_out in translate_sequences(args.lang, args.model, lines):
+            print("in:[%s] -> out:[%s]" % (seq_in, seq_out))
 
 """
 Command line parser
@@ -508,6 +518,7 @@ if __name__ == '__main__':
     parser_trans.add_argument('model', type=str, help='path to translation model')
     parser_trans.add_argument('-p', '--phrase', type=str, help='phrase to translate', required=False)
     parser_trans.add_argument('-f', '--file', type=str, help='file to read phrases from', required=False)
+    parser_trans.add_argument('-s', '--sample', type=int, help='number of elements from file to sample', required=False)
     parser_trans.set_defaults(func=handle_translate)
 
     if len(sys.argv) < 2:
