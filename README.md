@@ -1,3 +1,8 @@
+# Simple translator
+Based on Keras-nlp
+
+For theory behind operation look at the articles here: https://machinelearningmastery.com/category/attention/
+
 # usage examples
 
 ## Initialize text data
