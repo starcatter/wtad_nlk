@@ -358,7 +358,10 @@ def create_translator(input_dir: str, translator_dir: str, batch_size=256, embed
     )
 
     os.makedirs(translator_dir, exist_ok=True)
-    plot_model(transformer, show_shapes=True, to_file=os.path.join(translator_dir, "transformer.png"))
+    try:
+        plot_model(transformer, show_shapes=True, to_file=os.path.join(translator_dir, "transformer.png"))
+    except ImportError:
+        pass
 
     # must train at least one epoch before saving
     transformer.fit(train_ds, epochs=epochs, validation_data=val_ds)
